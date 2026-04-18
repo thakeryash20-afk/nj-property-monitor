@@ -70,6 +70,24 @@ python weekly_nj_digest.py \
   --hot-deal-threshold 15
 ```
 
+### Publish Snapshot For Streamlit Cloud (NewHomeSource Fallback)
+
+When NewHomeSource blocks Streamlit Cloud with 403, collect locally and publish a snapshot that Cloud can read:
+
+```bash
+python weekly_nj_digest.py \
+  --areas "Atlantic-Cape May,Bergen County,Hudson County,Mercer County,Middlesex County,Monmouth County,Morris County,Ocean County,Passaic County,Somerset County" \
+  --sources "newhomesource,zillow" \
+  --max-results 40
+
+python publish_cloud_snapshot.py
+git add cloud_snapshots/latest_snapshot.json
+git commit -m "Refresh cloud snapshot"
+git push
+```
+
+The Streamlit app automatically falls back to `cloud_snapshots/latest_snapshot.json` when live source calls return no listings.
+
 This writes:
 
 - Snapshots to `data/real_estate_monitor/snapshots/`

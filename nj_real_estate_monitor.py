@@ -47,6 +47,21 @@ DEFAULT_MAX_RESULTS = 40
 DEFAULT_TIMEOUT_SECONDS = 25
 DEFAULT_HOT_DEAL_THRESHOLD = 15.0
 DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+SECRET_ENV_KEYS = (
+    "OPENAI_API_KEY",
+    "OPENAI_MODEL",
+    "OPENAI_WEB_MODEL",
+    "ZILLOW_API_KEY",
+    "ZILLOW_PROVIDER",
+    "ZILLOW_API_URL",
+    "ZILLOW_API_HOST",
+    "ZILLOW_API_KEY_HEADER",
+    "ZILLOW_API_HOST_HEADER",
+    "ZILLOW_AREA_PARAM",
+    "ZILLOW_AREA_FORMAT",
+    "ZILLOW_HASDATA_TYPE",
+    "ZILLOW_EXTRA_QUERY_JSON",
+)
 
 
 @st.cache_data(ttl=60 * 60 * 6)
@@ -72,6 +87,26 @@ def init_state() -> None:
             st.session_state[key] = value
 
 
+def hydrate_env_from_streamlit_secrets() -> None:
+    try:
+        secrets_obj = st.secrets
+    except Exception:
+        return
+    for key in SECRET_ENV_KEYS:
+        if os.getenv(key, "").strip():
+            continue
+        try:
+            value = secrets_obj.get(key)  # type: ignore[assignment]
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            text = str(value).strip()
+            if text:
+                os.environ[key] = text
+
+
 def run_monitor(
     selected_areas: list[str],
     area_map: dict[str, str],
@@ -90,6 +125,11 @@ def run_monitor(
         max_results_per_area=max_results,
         timeout_seconds=timeout_seconds,
     )
+    if not listings and isinstance(previous_snapshot, dict):
+        previous_listings = previous_snapshot.get("listings")
+        if isinstance(previous_listings, list) and previous_listings:
+            listings = [dict(item) for item in previous_listings if isinstance(item, dict)]
+            warnings.append("Live sources returned no rows. Showing latest published snapshot data.")
     annotated, delta = annotate_changes(listings, previous_snapshot)
     scored_df = apply_deal_scoring(annotated, hot_deal_threshold_pct=hot_deal_threshold)
     snapshot_path = save_snapshot(
@@ -134,6 +174,11 @@ def autoload_hot_deals(area_map: dict[str, str]) -> None:
         max_results_per_area=30,
         timeout_seconds=25,
     )
+    if not listings and isinstance(previous_snapshot, dict):
+        previous_listings = previous_snapshot.get("listings")
+        if isinstance(previous_listings, list) and previous_listings:
+            listings = [dict(item) for item in previous_listings if isinstance(item, dict)]
+            warnings.append("Live sources returned no rows at startup. Showing latest published snapshot data.")
     annotated, delta = annotate_changes(listings, previous_snapshot)
     scored_df = apply_deal_scoring(annotated, hot_deal_threshold_pct=15.0)
     snapshot_path = save_snapshot(
@@ -1187,6 +1232,29 @@ def warning_block(warnings: list[str]) -> None:
             st.warning(warning)
 
 
+def data_source_diagnostics_block(report_df: pd.DataFrame | None, warnings: list[str], include_zillow: bool) -> None:
+    if report_df is not None and not report_df.empty:
+        return
+
+    raw_warnings = [str(item or "").lower() for item in warnings]
+    nhs_forbidden = any("newhomesource failed for" in item and "403" in item for item in raw_warnings)
+    zillow_failed = any(
+        "zillow request failed" in item or "zillow failed for" in item or "zillow property detail request failed" in item
+        for item in raw_warnings
+    )
+    zillow_missing = not include_zillow
+
+    st.warning("No listings were returned from active sources.")
+    if nhs_forbidden:
+        st.info("NewHomeSource is blocking this cloud environment right now.")
+    if zillow_missing:
+        st.info("Zillow is disabled. Add `ZILLOW_API_KEY` in Streamlit app Secrets to enable Zillow data.")
+    elif zillow_failed:
+        st.info("Zillow API requests are failing or rate-limited. Verify API key, quota, and provider endpoint.")
+    if not nhs_forbidden and not zillow_missing and not zillow_failed:
+        st.info("Try clicking 'Refresh Listings' and broadening filters (areas/sources/cities).")
+
+
 def metrics_block(summary_row: dict[str, int], snapshot_path: str) -> None:
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Listings", summary_row.get("total_count", 0))
@@ -1350,6 +1418,7 @@ def debug_block(raw_listings: list[dict]) -> None:
 
 def main() -> None:
     init_state()
+    hydrate_env_from_streamlit_secrets()
     header_block()
 
     property_token = query_property_token()
@@ -1390,6 +1459,11 @@ def main() -> None:
 
     warning_block(st.session_state["warnings"])
     report_df = st.session_state["report_df"]
+    data_source_diagnostics_block(
+        report_df=report_df,
+        warnings=st.session_state["warnings"],
+        include_zillow=include_zillow,
+    )
     if report_df is None:
         st.info("Run the monitor from the sidebar to generate this week's NJ report.")
         return

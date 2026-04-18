@@ -31,6 +31,8 @@ NHS_NJ_STATE_URL = f"{NHS_BASE_URL}/state/new-jersey"
 DATA_ROOT = Path("data/real_estate_monitor")
 SNAPSHOT_ROOT = DATA_ROOT / "snapshots"
 LATEST_SNAPSHOT_POINTER = DATA_ROOT / "latest_snapshot.json"
+CLOUD_SNAPSHOT_ROOT = Path("cloud_snapshots")
+CLOUD_LATEST_SNAPSHOT_FILE = CLOUD_SNAPSHOT_ROOT / "latest_snapshot.json"
 
 DEFAULT_NJ_AREAS = {
     "Atlantic-Cape May": f"{NHS_BASE_URL}/communities/nj/atlantic-cape-may-area",
@@ -735,6 +737,7 @@ def collect_listings(
                 except Exception as exc:
                     exc_text = str(exc).lower()
                     if "403" in exc_text and "newhomesource" in exc_text:
+                        warnings.append("NewHomeSource blocked requests from this environment; skipping NewHomeSource for this run.")
                         nhs_blocked = True
                         continue
                     warnings.append(f"NewHomeSource failed for '{area_name}': {exc}")
@@ -757,6 +760,42 @@ def collect_listings(
 
 def ensure_storage() -> None:
     SNAPSHOT_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _is_snapshot_payload(payload: Any) -> bool:
+    return isinstance(payload, dict) and isinstance(payload.get("listings"), list)
+
+
+def _load_cloud_snapshot_file() -> dict[str, Any] | None:
+    if not CLOUD_LATEST_SNAPSHOT_FILE.exists():
+        return None
+    try:
+        payload = json.loads(CLOUD_LATEST_SNAPSHOT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if _is_snapshot_payload(payload):
+        return payload
+    return None
+
+
+def _load_remote_snapshot() -> dict[str, Any] | None:
+    snapshot_url = os.getenv("CLOUD_SNAPSHOT_URL", "").strip()
+    if not snapshot_url:
+        return None
+    session = new_http_session()
+    try:
+        response = session.get(snapshot_url, timeout=20)
+    except requests.RequestException:
+        return None
+    if response.status_code >= 400:
+        return None
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    if _is_snapshot_payload(payload):
+        return payload
+    return None
 
 
 def save_snapshot(
@@ -799,10 +838,23 @@ def load_latest_snapshot() -> dict[str, Any] | None:
             pass
 
     snapshots = sorted(SNAPSHOT_ROOT.glob("snapshot_*.json"))
-    if not snapshots:
-        return None
-    latest_path = snapshots[-1]
-    return json.loads(latest_path.read_text(encoding="utf-8"))
+    if snapshots:
+        latest_path = snapshots[-1]
+        return json.loads(latest_path.read_text(encoding="utf-8"))
+
+    # Streamlit Cloud fallback: use repo-published snapshot when live collection is blocked.
+    cloud_snapshot = _load_cloud_snapshot_file()
+    if cloud_snapshot is not None:
+        return cloud_snapshot
+    return _load_remote_snapshot()
+
+
+def publish_cloud_snapshot(snapshot: dict[str, Any], output_path: Path = CLOUD_LATEST_SNAPSHOT_FILE) -> Path:
+    if not _is_snapshot_payload(snapshot):
+        raise ValueError("Invalid snapshot payload: expected a dict with a listings array.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    return output_path
 
 
 def annotate_changes(
