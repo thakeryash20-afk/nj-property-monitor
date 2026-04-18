@@ -975,12 +975,15 @@ def should_show_ui_warning(message: str) -> bool:
     text = str(message or "").strip().lower()
     if not text:
         return False
-    suppress_markers = (
-        "zillow request failed",
-        "zillow failed for",
-        "zillow property detail request failed",
-    )
-    return not any(marker in text for marker in suppress_markers)
+    if "zillow request failed" in text or "zillow failed for" in text or "zillow property detail request failed" in text:
+        return False
+    if "newhomesource failed for" in text and "403" in text:
+        return False
+    if "newhomesource property detail request failed" in text and "403" in text:
+        return False
+    if "403 client error: forbidden for url: https://www.newhomesource.com" in text:
+        return False
+    return True
 
 
 def render_property_detail_page(

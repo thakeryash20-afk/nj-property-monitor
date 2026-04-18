@@ -259,9 +259,23 @@ def new_http_session() -> requests.Session:
     return session
 
 
+def _nhs_headers(referer: str | None = None) -> dict[str, str]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
+
 def fetch_nhs_nj_areas(timeout_seconds: int = 25) -> dict[str, str]:
     session = new_http_session()
-    response = session.get(NHS_NJ_STATE_URL, timeout=timeout_seconds)
+    response = session.get(NHS_NJ_STATE_URL, timeout=timeout_seconds, headers=_nhs_headers(referer=NHS_BASE_URL))
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
 
@@ -371,13 +385,40 @@ def fetch_newhomesource_area_listings(
 ) -> list[dict[str, Any]]:
     session = session or new_http_session()
     if not getattr(session, "_nhs_warmed", False):
-        session.get(NHS_NJ_STATE_URL, timeout=timeout_seconds, headers={"Referer": f"{NHS_BASE_URL}/"})
+        try:
+            session.get(NHS_BASE_URL, timeout=timeout_seconds, headers=_nhs_headers())
+            session.get(NHS_NJ_STATE_URL, timeout=timeout_seconds, headers=_nhs_headers(referer=NHS_BASE_URL))
+        except requests.RequestException:
+            pass
         setattr(session, "_nhs_warmed", True)
-    response = session.get(
-        area_url,
-        timeout=timeout_seconds,
-        headers={"Referer": NHS_NJ_STATE_URL},
-    )
+
+    response: requests.Response | None = None
+    last_exc: requests.RequestException | None = None
+    for attempt in range(2):
+        try:
+            response = session.get(
+                area_url,
+                timeout=timeout_seconds,
+                headers=_nhs_headers(referer=NHS_NJ_STATE_URL),
+            )
+        except requests.RequestException as exc:
+            last_exc = exc
+            time.sleep(0.6)
+            continue
+
+        if response.status_code == 403 and attempt == 0:
+            try:
+                session.get(NHS_NJ_STATE_URL, timeout=timeout_seconds, headers=_nhs_headers(referer=NHS_BASE_URL))
+            except requests.RequestException:
+                pass
+            time.sleep(0.8)
+            continue
+        break
+
+    if response is None:
+        if last_exc is not None:
+            raise last_exc
+        raise requests.RequestException("NewHomeSource area request failed without response.")
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
     cards = soup.select(".nhs-n1-c-card--housing")
@@ -670,13 +711,14 @@ def collect_listings(
     all_listings: list[dict[str, Any]] = []
     warnings: list[str] = []
     nhs_session = new_http_session() if include_newhomesource else None
+    nhs_blocked = False
 
     zillow_api_enabled = include_zillow and bool(_zillow_api_settings().get("api_key"))
     if include_zillow and not zillow_api_enabled:
         warnings.append("Zillow skipped: set ZILLOW_API_KEY to enable Zillow ingestion.")
 
     for area_name in selected_areas:
-        if include_newhomesource:
+        if include_newhomesource and not nhs_blocked:
             area_url = area_map.get(area_name)
             if not area_url:
                 warnings.append(f"NewHomeSource skipped '{area_name}': missing area URL.")
@@ -691,6 +733,10 @@ def collect_listings(
                     )
                     all_listings.extend(nhs_rows)
                 except Exception as exc:
+                    exc_text = str(exc).lower()
+                    if "403" in exc_text and "newhomesource" in exc_text:
+                        nhs_blocked = True
+                        continue
                     warnings.append(f"NewHomeSource failed for '{area_name}': {exc}")
 
         if zillow_api_enabled:
